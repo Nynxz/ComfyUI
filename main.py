@@ -183,6 +183,8 @@ def prompt_worker(q, server_instance):
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
 
+        if server_instance.prompt_queue_state == "paused":
+            continue
         queue_item = q.get(timeout=timeout)
         if queue_item is not None:
             item, item_id = queue_item
@@ -322,6 +324,17 @@ def start_comfyui(asyncio_loop=None):
     cuda_malloc_warning()
     setup_database()
 
+    try:
+        logging.info("Loading Persistence...")
+        persistence_root = folder_paths.get_user_directory() or folder_paths.get_output_directory()
+        persistence_path = os.path.join(persistence_root, "prompt_queue.json")
+        logging.info("Persistence Path: " + persistence_path)
+        max_number = prompt_server.prompt_queue.enable_persistence(persistence_path)
+        if max_number >= 0 and max_number + 1 > prompt_server.number:
+            prompt_server.number = max_number = 1
+            logging.info(f"restored {len(prompt_server.prompt_queue.queue)} queued prompts from persistence.")
+    except Exception as e:
+        logging.error(f"Failed to restore queued prompts from persistence: {e}")
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 

@@ -159,6 +159,7 @@ class PromptServer():
         self.internal_routes = InternalRoutes(self)
         self.supports = ["custom_nodes_from_web"]
         self.prompt_queue = execution.PromptQueue(self)
+        self.prompt_queue_state = "running"
         self.loop = loop
         self.messages = asyncio.Queue()
         self.client_session:Optional[aiohttp.ClientSession] = None
@@ -189,6 +190,20 @@ class PromptServer():
         self.client_id = None
 
         self.on_prompt_handlers = []
+
+        @routes.post('/pause')
+        async def post_pause(request):
+            logging.info("Got Paused Queue!")
+            logging.info("Current State = " + self.prompt_queue_state)
+            if self.prompt_queue_state == "running":
+                self.prompt_queue_state = "paused"
+            else:
+                self.prompt_queue_state = "running"
+            logging.info("New State = " + self.prompt_queue_state)
+            return web.json_response({
+                "State": self.prompt_queue_state
+            })
+
 
         @routes.get('/ws')
         async def websocket_handler(request):

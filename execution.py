@@ -1,8 +1,14 @@
 import copy
 import heapq
 import inspect
+import json
 import logging
+from math import e
+from os import path
+import os
 import sys
+import tempfile
+import tempfile
 import threading
 import time
 import traceback
@@ -1084,12 +1090,105 @@ class PromptQueue:
         self.currently_running = {}
         self.history = {}
         self.flags = {}
+        self.persistence_path: Optional[str] = None
+        self.failed_items_for_persistence: list = []
+
+    def enable_persistence(self, persistence_path: str) -> int:
+        with self.mutex:
+            self.persistence_path = persistence_path
+            os.makedirs(os.path.dirname(persistence_path), exist_ok=True)
+            return self._load_persisted_locked()
+
+    def _sanitize_extra(self, extra: dict) -> dict:
+        if extra is None:
+            return {}
+        extra = copy.deepcopy(extra)
+        for k in SENSITIVE_EXTRA_DATA_KEYS:
+            if k in extra:
+                extra.pop(k)
+        return extra
+
+    def _seralize_item(self, item):
+        number, prompt_id, prompt, extra_data, outputs_to_execute = item
+        return {"number": number,
+                "prompt_id": prompt_id,
+                "prompt": prompt,
+                "extra_data": self._sanitize_extra(extra_data),
+                "outputs_to_execute": outputs_to_execute
+                }
+
+    def _persist_locked(self):
+        if not self.persistence_path:
+            return
+        data = {
+            "version": 1,
+            "queue": [self._seralize_item(i) for i in self.queue],
+            "incomplete": (
+                [self._seralize_item(i) for i in self.currently_running.values()] +
+                [self._seralize_item(i)
+                 for i in self.failed_items_for_persistence]
+            )
+        }
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix="prompt_queue_", suffix=".json", dir=os.path.dirname(self.persistence_path))
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, self.persistence_path)
+        except Exception as e:
+            logging.error(f"Failed to persist queue: {e}")
+            try:
+                os.remove(tmp_name)
+            except Exception as e:
+                logging.error(
+                    f"Failed to remove temporary file {tmp_name}: {e}")
+
+    def _load_persisted_locked(self) -> int:
+        if not self.persistence_path or not os.path.isfile(self.persistence_path):
+            logging.error("Persistence path is not set or file does not exist")
+            return -1
+        max_number = -1
+        try:
+            with open(self.persistence_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            items = []
+            for section in ("queue", "incomplete"):
+                logging.info(section)
+                for entry in data.get(section, []):
+                    logging.info(entry)
+                    logging.debug(f"Loading persisted entry: {entry}")
+                    try:
+                        number = entry["number"]
+                        prompt_id = entry["prompt_id"]
+                        prompt = entry["prompt"]
+                        extra = entry.get("extra_data", {}) or {}
+                        outputs = entry.get("outputs_to_execute", [])
+                        items.append(
+                            (number, prompt_id, prompt, extra, outputs))
+                        if number > max_number:
+                            max_number = number
+                    except Exception:
+                        continue
+            self.queue = []
+            for it in items:
+                heapq.heappush(self.queue, it)
+            self.failed_items_for_persistence = []
+            self.server.queue_updated()
+            logging.info("Loaded persisted queue successfully")
+            logging.info(f"Max number in queue: {max_number}")
+            return max_number
+        except Exception as e:
+            logging.error(f"Failed to load persisted queue: {e}")
+            return -1
 
     def put(self, item):
         with self.mutex:
             heapq.heappush(self.queue, item)
             self.server.queue_updated()
             self.not_empty.notify()
+            self._persist_locked()
 
     def get(self, timeout=None):
         with self.not_empty:
@@ -1102,6 +1201,7 @@ class PromptQueue:
             self.currently_running[i] = copy.deepcopy(item)
             self.task_counter += 1
             self.server.queue_updated()
+            self._persist_locked()
             return (item, i)
 
     class ExecutionStatus(NamedTuple):
@@ -1132,6 +1232,9 @@ class PromptQueue:
             }
             self.history[prompt[1]].update(history_result)
             self.server.queue_updated()
+            if status is None or not status.completed:
+                self.failed_items_for_persistence.append(prompt)
+            self._persist_locked()
 
     # Note: slow
     def get_current_queue(self):
@@ -1156,6 +1259,7 @@ class PromptQueue:
         with self.mutex:
             self.queue = []
             self.server.queue_updated()
+            self._persist_locked()
 
     def delete_queue_item(self, function):
         with self.mutex:
@@ -1167,6 +1271,7 @@ class PromptQueue:
                         self.queue.pop(x)
                         heapq.heapify(self.queue)
                     self.server.queue_updated()
+                    self._persist_locked()
                     return True
         return False
 
