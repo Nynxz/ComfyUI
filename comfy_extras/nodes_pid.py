@@ -21,24 +21,54 @@ class PiDConditioning(io.ComfyNode):
             inputs=[
                 io.Conditioning.Input("positive"),
                 io.Latent.Input("latent", tooltip="latent (from VAEEncode or a KSampler)."),
-                io.Combo.Input("latent_format", options=["flux", "sd3"], default="flux",
-                               tooltip="Flux1 and Flux2 latents auto-detected from channel dim, sd3 has to be selected manually."),
+                io.Combo.Input("latent_format", options=["flux", "sd3", "sdxl", "qwen_image"], default="flux",
+                               tooltip="Picks the VAE normalization to match the PiD student. Flux1 and Flux2 are "
+                                       "auto-detected from the channel dim; sd3 (16ch), sdxl (4ch) and qwen_image "
+                                       "(16ch, Wan2.1 VAE) must be selected manually. qwen_image covers both "
+                                       "Qwen-Image and Qwen-Image-2512 (same VAE + student)."),
                 io.Float.Input(
                     "degrade_sigma", default=0.0, min=0.0, max=1.0, step=0.01,
                     tooltip="0 = clean latent. Increase to denoise corrupted latent outputs.",
+                ),
+                io.Boolean.Input(
+                    "synthesize_noise", default=False,
+                    tooltip="Blend Gaussian noise INTO the latent: (1-degrade_sigma)*latent + degrade_sigma*noise. "
+                            "Turn ON when feeding a CLEAN VAEEncode latent you want to restore/clean — this matches "
+                            "NVIDIA's from_clean pipeline, where degrade_sigma both dilutes the latent and tells the "
+                            "gate to distrust it (gives the smoother regenerated look). Leave OFF when the latent is "
+                            "already noisy (e.g. an early-stopped KSampler), where degrade_sigma should only match the "
+                            "existing noise level.",
+                ),
+                io.Int.Input(
+                    "noise_seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True,
+                    tooltip="Seed for the synthesized noise (only used when synthesize_noise is on).",
                 ),
             ],
             outputs=[io.Conditioning.Output()],
         )
 
     @classmethod
-    def execute(cls, positive, latent, latent_format: str, degrade_sigma: float) -> io.NodeOutput:
+    def execute(cls, positive, latent, latent_format: str, degrade_sigma: float,
+                synthesize_noise: bool = False, noise_seed: int = 0) -> io.NodeOutput:
         samples = latent["samples"]
         if latent_format == "flux":
             fmt_cls = comfy.latent_formats.Flux2 if samples.shape[1] == 128 else comfy.latent_formats.Flux
         else:
-            fmt_cls = comfy.latent_formats.SD3
+            fmt_cls = {
+                "sd3": comfy.latent_formats.SD3,
+                "sdxl": comfy.latent_formats.SDXL,
+                "qwen_image": comfy.latent_formats.Wan21,
+            }[latent_format]
         lq_latent = fmt_cls().process_in(samples)
+        # Qwen-Image uses the Wan2.1 VAE, whose latents carry a temporal axis
+        # ([B, C, T, H, W], T=1 for images). PiD's lq_proj operates on 4D
+        # [B, C, H, W], so collapse the temporal frame.
+        if lq_latent.ndim == 5:
+            lq_latent = lq_latent[:, :, 0]
+        if synthesize_noise and degrade_sigma > 0.0:
+            g = torch.Generator(device=lq_latent.device).manual_seed(int(noise_seed))
+            noise = torch.randn(lq_latent.shape, generator=g, dtype=lq_latent.dtype, device=lq_latent.device)
+            lq_latent = (1.0 - degrade_sigma) * lq_latent + degrade_sigma * noise
         sigma_t = torch.tensor([float(degrade_sigma)], dtype=torch.float32)
         return io.NodeOutput(node_helpers.conditioning_set_values(
             positive, {"lq_latent": lq_latent, "degrade_sigma": sigma_t},
