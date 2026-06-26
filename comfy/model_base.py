@@ -1068,6 +1068,40 @@ class Flux2(Flux):
         return out
 
 
+class Flux2Sefi(Flux2):
+    # SeFi-Image: Flux.2 Klein backbone with a dual (semantic+texture) latent stream.
+    # The diffusion model denoises [semantic | texture] channels jointly; only the
+    # texture stream is decoded by the Flux2 VAE.
+    def __init__(self, model_config, model_type=ModelType.FLUX, device=None):
+        # ModelType.FLUX (ModelSamplingFlux) like Flux/Flux2: timestep == sigma in
+        # [0,1] so the DiT's time_factor=1000 embedder sees 0..1000. ModelType.FLOW
+        # would pre-scale by 1000 and the embedding would blow up (no denoising).
+        super().__init__(model_config, model_type, device=device)
+        self.semantic_channels = model_config.unet_config.get("semantic_channels", 0)
+        # The working/sampling latent spans both streams; make the latent format agree so
+        # fix_empty_latent_channels keeps all channels (works for any semantic count).
+        self.latent_format.latent_channels = model_config.unet_config["in_channels"]
+        # Semantic-first lead (delta_t): the DiT can evaluate the semantic stream at a
+        # lower timestep (cleaner) than the texture stream. Doing that *faithfully*
+        # requires per-stream sigma rates in the sampling loop (the reference's dual-rate
+        # update keeps the two latents at genuinely different noise levels). With a stock
+        # KSampler both streams share one schedule, so a nonzero lead only tells the DiT
+        # the semantic latent is cleaner than it actually is — which wrecks global
+        # composition (the image tiles). Default to 0 (lockstep joint diffusion), which
+        # is correct for stock samplers and produces coherent images. The semantic-first
+        # SAMPLER node (SamplerSefiSemanticFirst) does the real per-stream dual-rate via
+        # transformer_options["sefi_t_sem"] and reads sefi_delta_t_trained below.
+        self.diffusion_model.sefi_delta_t_trained = float(self.diffusion_model.sefi_delta_t)
+        delta_t = getattr(model_config, "sampling_settings", {}).get("sefi_delta_t", 0.0)
+        self.diffusion_model.sefi_delta_t = float(delta_t)
+
+    def process_latent_out(self, latent):
+        # Keep only the texture stream (trailing channels) for VAE decode.
+        if self.semantic_channels:
+            latent = latent[:, self.semantic_channels:]
+        return super().process_latent_out(latent)
+
+
 class Lens(BaseModel):
     def __init__(self, model_config, model_type=ModelType.FLUX, device=None):
         super().__init__(

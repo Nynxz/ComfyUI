@@ -239,6 +239,18 @@ class Flux2(LatentFormat):
     def process_out(self, latent):
         return latent
 
+class Flux2Sefi(Flux2):
+    # SeFi-Image denoises a [semantic | texture] latent; the working latent has
+    # semantic + 128 (texture) channels (default 16 + 128 = 144). model_base.Flux2Sefi
+    # overrides latent_channels per-checkpoint so empty latents keep all channels.
+    latent_channels = 144
+
+    def __init__(self):
+        super().__init__()
+        # Preview only the texture stream (the trailing 128 channels feed the VAE).
+        _flux2_reshape = self.latent_rgb_factors_reshape
+        self.latent_rgb_factors_reshape = lambda t: _flux2_reshape(t[:, t.shape[1] - 128:])
+
 class TripoSplat(LatentFormat):
     # Sequence latent (B, 8192, 16) the camera token rides alongside as a second nested latent
     latent_channels = 16

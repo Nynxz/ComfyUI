@@ -3,6 +3,7 @@ import comfy.utils
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 import comfy.model_management
+import comfy.samplers
 import torch
 import math
 import nodes
@@ -55,6 +56,114 @@ class EmptyFlux2LatentImage(io.ComfyNode):
     def execute(cls, width, height, batch_size=1) -> io.NodeOutput:
         latent = torch.zeros([batch_size, 128, height // 16, width // 16], device=comfy.model_management.intermediate_device())
         return io.NodeOutput({"samples": latent})
+
+class EmptySefiLatent(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="EmptySefiLatent",
+            display_name="Empty SeFi Latent",
+            category="model/latent/flux",
+            description="Empty latent for SeFi-Image (semantic + texture channels, read from the model).",
+            inputs=[
+                io.Model.Input("model", tooltip="The SeFi-Image diffusion model (sets the channel count)."),
+                io.Int.Input("width", default=1024, min=16, max=nodes.MAX_RESOLUTION, step=16),
+                io.Int.Input("height", default=1024, min=16, max=nodes.MAX_RESOLUTION, step=16),
+                io.Int.Input("batch_size", default=1, min=1, max=4096),
+            ],
+            outputs=[
+                io.Latent.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, model: io.Model.Type, width, height, batch_size=1) -> io.NodeOutput:
+        # SeFi denoises [semantic | texture]; total channels are derived from the checkpoint.
+        channels = model.model.model_config.unet_config["in_channels"]
+        latent = torch.zeros([batch_size, channels, height // 16, width // 16], device=comfy.model_management.intermediate_device())
+        return io.NodeOutput({"samples": latent})
+
+
+def _sefi_semantic_first_sampler(delta_t, semantic_channels, timestep_shift_alpha):
+    """Build a KSAMPLER that runs SeFi's semantic-first dual-rate update.
+
+    The latent is [semantic | texture]. The semantic stream leads the texture
+    stream by ``delta_t`` on its own sigma schedule (the reference's dual-rate
+    loop), so the texture stream denoises against an already-cleaner semantic
+    anchor — which the model was trained for. Each stream is advanced by its own
+    d-sigma; the per-stream velocity is recovered from the model's denoised output
+    (sigma_tex is used for the whole batch, so v = (x - denoised)/sigma_tex is the
+    raw velocity for both halves). The semantic timestep is handed to the DiT via
+    transformer_options["sefi_t_sem"]. SeFi trains on a linear flow schedule, so
+    the schedule is rebuilt linearly here (the connected scheduler only sets the
+    step count and sigma_max); timestep_shift_alpha applies the base/RL warp.
+    """
+    @torch.no_grad()
+    def sample(model, x, sigmas, extra_args=None, callback=None, disable=None, **kwargs):
+        extra_args = {} if extra_args is None else extra_args
+        steps = len(sigmas) - 1
+        if steps < 1:
+            return x
+        sig_max = float(sigmas[0])
+        u = torch.linspace(0.0, 1.0, steps + 1, device=x.device, dtype=torch.float64)
+        if timestep_shift_alpha != 1.0:                      # base/RL schedule warp
+            a = timestep_shift_alpha
+            u = (a * u) / (1.0 + (a - 1.0) * u)
+        u_sem = torch.clamp(u * (1.0 + delta_t), max=1.0)            # semantic leads
+        u_tex = torch.clamp(u * (1.0 + delta_t) - delta_t, min=0.0, max=1.0)
+        sig_sem = ((1.0 - u_sem) * sig_max).to(x.dtype)
+        sig_tex = ((1.0 - u_tex) * sig_max).to(x.dtype)
+        mo = extra_args.setdefault("model_options", {})
+        to = mo.setdefault("transformer_options", {})
+        s = semantic_channels
+        for i in range(steps):
+            s_tex, s_tex_n = sig_tex[i], sig_tex[i + 1]
+            s_sem, s_sem_n = sig_sem[i], sig_sem[i + 1]
+            # tell the DiT the semantic stream's (cleaner) timestep == its sigma (FLUX sampling)
+            to["sefi_t_sem"] = s_sem.reshape(1).expand(x.shape[0]).clone()
+            sigma_in = s_tex.reshape(1).expand(x.shape[0]).clone()
+            denoised = model(x, sigma_in, **extra_args)
+            velocity = (x - denoised) / s_tex.clamp(min=1e-6)
+            nx = x.clone()
+            nx[:, :s] = x[:, :s] + (s_sem_n - s_sem) * velocity[:, :s]   # semantic rate
+            nx[:, s:] = x[:, s:] + (s_tex_n - s_tex) * velocity[:, s:]   # texture rate
+            x = nx
+            if callback is not None:
+                callback({"x": x, "i": i, "sigma": s_tex, "sigma_hat": s_tex, "denoised": denoised})
+        to.pop("sefi_t_sem", None)
+        return x
+    return comfy.samplers.KSAMPLER(sample)
+
+
+class SamplerSefiSemanticFirst(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SamplerSefiSemanticFirst",
+            display_name="SeFi Semantic-First Sampler",
+            category="sampling/custom_sampling/samplers",
+            description="SeFi-Image semantic-first dual-rate sampler (use with SamplerCustomAdvanced). "
+                        "Runs the model in-distribution (semantic stream leads texture) for sharper, "
+                        "more natural detail than the stock lockstep path.",
+            inputs=[
+                io.Model.Input("model", tooltip="The SeFi-Image model (provides semantic channels + trained delta_t)."),
+                io.Float.Input("delta_t", default=-1.0, min=-1.0, max=1.0, step=0.01,
+                               tooltip="Semantic-first lead. -1 = use the checkpoint's trained value."),
+                io.Float.Input("timestep_shift_alpha", default=1.0, min=0.01, max=10.0, step=0.01,
+                               tooltip="Schedule warp: 1.0 for turbo, 0.3 for base/RL."),
+            ],
+            outputs=[io.Sampler.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model: io.Model.Type, delta_t=-1.0, timestep_shift_alpha=1.0) -> io.NodeOutput:
+        unet_config = model.model.model_config.unet_config
+        semantic_channels = unet_config.get("semantic_channels", 0)
+        if semantic_channels <= 0:
+            raise ValueError("SamplerSefiSemanticFirst requires a SeFi-Image model (no semantic channels found).")
+        if delta_t < 0.0:
+            delta_t = float(getattr(model.model.diffusion_model, "sefi_delta_t_trained", 0.1))
+        return io.NodeOutput(_sefi_semantic_first_sampler(delta_t, semantic_channels, timestep_shift_alpha))
 
 class FluxGuidance(io.ComfyNode):
     @classmethod
@@ -310,6 +419,8 @@ class FluxExtension(ComfyExtension):
             FluxKontextImageScale,
             FluxKontextMultiReferenceLatentMethod,
             EmptyFlux2LatentImage,
+            EmptySefiLatent,
+            SamplerSefiSemanticFirst,
             Flux2Scheduler,
             FluxKVCache,
         ]

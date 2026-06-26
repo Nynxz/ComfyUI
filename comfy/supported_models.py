@@ -834,6 +834,37 @@ class Flux2(Flux):
         return None
 
 
+class Flux2Sefi(Flux2):
+    """SeFi-Image: Flux.2 Klein backbone + Semantic-First dual-stream diffusion.
+
+    Reuses the entire Flux2 stack (DiT, Qwen3 Klein text encoder, Flux2 bn-VAE,
+    latent format). The only deltas live in the DiT (dual-timestep embedding +
+    semantic/texture channel split) and the sampling schedule.
+    """
+    unet_config = {
+        "image_model": "flux2_sefi",
+    }
+
+    # Turbo uses a linear flow schedule: its scheduler has use_dynamic_shifting=True but
+    # the reference never calls set_timesteps, so the sigmas stay linear (no shift) and
+    # timestep_shift_alpha=1.0 adds no warp. shift=1.0 in ModelSamplingFlux reproduces
+    # that linear sigma=t curve. (Base/RL families warp with alpha=0.3 and would want a
+    # different shift.) delta_t (semantic-lead) defaults to 0 in model_base.Flux2Sefi;
+    # add "sefi_delta_t" here only once a dual-rate sampler can honor it.
+    sampling_settings = {
+        "shift": 1.0,
+    }
+
+    # The working latent is [semantic | texture] (semantic + 128 channels), not 128.
+    latent_format = latent_formats.Flux2Sefi
+
+    def get_model(self, state_dict, prefix="", device=None):
+        out = model_base.Flux2Sefi(self, device=device)
+        return out
+
+    # clip_target (Qwen3 Klein) and the Flux2 VAE are inherited unchanged.
+
+
 class Lens(supported_models_base.BASE):
     """Microsoft Lens (3.8B dual-stream MMDiT, GPT-OSS-20B text features, Flux2 VAE)."""
 
@@ -2356,6 +2387,7 @@ models = [
     QwenImage,
     Ideogram4,
     Krea2,
+    Flux2Sefi,
     Flux2,
     Lens,
     Kandinsky5Image,

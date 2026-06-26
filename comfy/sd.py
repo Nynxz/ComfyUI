@@ -1360,6 +1360,7 @@ class TEModel(Enum):
     GPT_OSS_20B = 33
     QWEN3VL_4B = 34
     QWEN3VL_8B = 35
+    QWEN3VL_2B = 36
 
 
 def detect_te_model(sd):
@@ -1422,7 +1423,12 @@ def detect_te_model(sd):
             return TEModel.QWEN35_27B
         return TEModel.QWEN35_2B
     if "model.visual.deepstack_merger_list.0.norm.weight" in sd:  # DeepStack is unique to Qwen3-VL
-        return TEModel.QWEN3VL_4B if sd["model.visual.merger.linear_fc2.weight"].shape[0] == 2560 else TEModel.QWEN3VL_8B
+        merger_dim = sd["model.visual.merger.linear_fc2.weight"].shape[0]
+        if merger_dim == 2560:
+            return TEModel.QWEN3VL_4B
+        if merger_dim == 2048:
+            return TEModel.QWEN3VL_2B
+        return TEModel.QWEN3VL_8B
     if "model.layers.0.post_attention_layernorm.weight" in sd:
         weight = sd['model.layers.0.post_attention_layernorm.weight']
         if 'model.layers.0.self_attn.q_norm.weight' in sd:
@@ -1621,8 +1627,12 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
             qwen35_type = {TEModel.QWEN35_08B: "qwen35_08b", TEModel.QWEN35_2B: "qwen35_2b", TEModel.QWEN35_4B: "qwen35_4b", TEModel.QWEN35_9B: "qwen35_9b", TEModel.QWEN35_27B: "qwen35_27b"}[te_model]
             clip_target.clip = comfy.text_encoders.qwen35.te(**llama_detect(clip_data), model_type=qwen35_type)
             clip_target.tokenizer = comfy.text_encoders.qwen35.tokenizer(model_type=qwen35_type)
-        elif te_model in (TEModel.QWEN3VL_4B, TEModel.QWEN3VL_8B):
-            if clip_type == CLIPType.IDEOGRAM4 and te_model == TEModel.QWEN3VL_8B:  # Ideogram4 reuses the full Qwen3-VL-8B (13-layer tap for conditioning + multimodal generate).
+        elif te_model in (TEModel.QWEN3VL_4B, TEModel.QWEN3VL_8B, TEModel.QWEN3VL_2B):
+            if te_model == TEModel.QWEN3VL_2B:  # SeFi-Image / Flux2-Klein 1-2B: Qwen3-VL-2B LM (3-layer tap -> 6144); visual unused.
+                clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
+                clip_target.clip = comfy.text_encoders.flux.klein_te(**llama_detect(clip_data), model_type="qwen3_2b")
+                clip_target.tokenizer = comfy.text_encoders.flux.KleinTokenizer2B
+            elif clip_type == CLIPType.IDEOGRAM4 and te_model == TEModel.QWEN3VL_8B:  # Ideogram4 reuses the full Qwen3-VL-8B (13-layer tap for conditioning + multimodal generate).
                 clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
                 clip_target.clip = comfy.text_encoders.ideogram4.te_qwen3vl(**llama_detect(clip_data))
                 clip_target.tokenizer = comfy.text_encoders.ideogram4.Ideogram4Qwen3VLTokenizer
@@ -1634,7 +1644,11 @@ def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip
                 clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
                 clip_target.clip = comfy.text_encoders.krea2.te(**llama_detect(clip_data))
                 clip_target.tokenizer = comfy.text_encoders.krea2.Krea2Tokenizer
-            elif clip_type in (CLIPType.FLUX, CLIPType.FLUX2):  # Flux2 Klein reuses the Qwen3-VL LM (3-layer tap -> 12288); visual unused.
+            elif clip_type in (CLIPType.FLUX, CLIPType.FLUX2):  # Flux2 Klein / SeFi-Image reuses the Qwen3-VL LM (3-layer tap -> 12288); visual unused.
+                # SeFi-Image (and full Qwen3-VL releases) ship the multimodal layout
+                # (model.language_model.* / model.visual.*); strip to the LM layout klein_te
+                # expects. No-op for checkpoints already in the bare model.layers.* layout.
+                clip_data[0] = comfy.utils.state_dict_prefix_replace(clip_data[0], {"model.language_model.": "model.", "model.visual.": "visual.", "lm_head.": "model.lm_head."})
                 klein_model_type = "qwen3_8b" if te_model == TEModel.QWEN3VL_8B else "qwen3_4b"
                 clip_target.clip = comfy.text_encoders.flux.klein_te(**llama_detect(clip_data), model_type=klein_model_type)
                 clip_target.tokenizer = comfy.text_encoders.flux.KleinTokenizer8B if te_model == TEModel.QWEN3VL_8B else comfy.text_encoders.flux.KleinTokenizer

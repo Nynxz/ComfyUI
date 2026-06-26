@@ -326,6 +326,15 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
             if dit_config.get("context_in_dim") == 3584 and dit_config["vec_in_dim"] is None:  # LongCat-Image
                 dit_config["txt_ids_dims"] = [1, 2]
 
+        if dit_config["image_model"] == "flux2" and '{}time_in_sem.in_layer.weight'.format(key_prefix) in state_dict_keys:  # SeFi-Image (semantic-first dual stream on Flux2)
+            dit_config["image_model"] = "flux2_sefi"
+            dit_config["sefi_dual_timestep"] = True
+            out_w = state_dict['{}final_layer.linear.weight'.format(key_prefix)]
+            dit_config["out_channels"] = out_w.shape[0] // (patch_size * patch_size)  # SeFi predicts both streams: out == in == total
+            dit_config["semantic_channels"] = dit_config["in_channels"] - 128  # texture stream is the 128-ch Flux2 VAE latent
+            if metadata is not None and metadata.get("sefi.delta_t") not in (None, "", "None"):  # semantic-lead offset (not in tensors)
+                dit_config["sefi_delta_t"] = float(metadata["sefi.delta_t"])
+
         return dit_config
 
     if '{}t5_yproj.weight'.format(key_prefix) in state_dict_keys: #Genmo mochi preview

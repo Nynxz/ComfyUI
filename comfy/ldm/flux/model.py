@@ -42,6 +42,9 @@ class FluxParams:
     ref_index_scale: float = 1.0
     yak_mlp: bool = False
     txt_norm: bool = False
+    sefi_dual_timestep: bool = False  # SeFi-Image: dual (semantic+texture) timestep embedding
+    semantic_channels: int = 0        # SeFi-Image: leading channels that are the semantic stream
+    sefi_delta_t: float = 0.0         # SeFi-Image: semantic-lead timestep offset (from checkpoint metadata)
 
 
 def invert_slices(slices, length):
@@ -84,7 +87,13 @@ class Flux(nn.Module):
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
         self.img_in = operations.Linear(self.in_channels, self.hidden_size, bias=params.ops_bias, dtype=dtype, device=device)
-        self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, bias=params.ops_bias, dtype=dtype, device=device, operations=operations)
+        if params.sefi_dual_timestep:
+            # SeFi-Image: separate semantic/texture timestep embedders, each hidden_size//2, concatenated.
+            self.sefi_delta_t = params.sefi_delta_t  # semantic-lead offset in timestep space
+            self.time_in_sem = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size // 2, bias=params.ops_bias, dtype=dtype, device=device, operations=operations)
+            self.time_in_tex = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size // 2, bias=params.ops_bias, dtype=dtype, device=device, operations=operations)
+        else:
+            self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, bias=params.ops_bias, dtype=dtype, device=device, operations=operations)
         if params.vec_in_dim is not None:
             self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
         else:
@@ -167,7 +176,26 @@ class Flux(nn.Module):
 
         # running on sequences img
         img = self.img_in(img)
-        vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
+        if self.params.sefi_dual_timestep:
+            # SeFi-Image semantic-first: the semantic stream is evaluated at a timestep
+            # advanced (cleaner) than texture, giving the texture stream a structural anchor.
+            # A dual-rate sampler (per-stream sigma schedules) passes the exact semantic
+            # timestep via "sefi_t_sem"; otherwise approximate it as t_tex - delta_t.
+            t_tex = timesteps
+            t_sem = transformer_options.get("sefi_t_sem", None)
+            if t_sem is None:
+                delta_t = transformer_options.get("sefi_delta_t", getattr(self, "sefi_delta_t", 0.0))
+                t_sem = torch.clamp(timesteps - delta_t, min=0.0) if delta_t else timesteps
+            else:
+                # per-step scalar; broadcast to the timestep batch (CFG may have doubled it)
+                val = t_sem.reshape(-1)[0] if torch.is_tensor(t_sem) else float(t_sem)
+                t_sem = torch.full_like(timesteps, float(val))
+            vec = torch.cat((
+                self.time_in_sem(timestep_embedding(t_sem, 256).to(img.dtype)),
+                self.time_in_tex(timestep_embedding(t_tex, 256).to(img.dtype)),
+            ), dim=-1)
+        else:
+            vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
         if self.params.guidance_embed:
             if guidance is not None:
                 vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
