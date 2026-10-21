@@ -435,7 +435,13 @@ class JsonExtractString(io.ComfyNode):
                 continue
 
             value = data.get(key)
-            return io.NodeOutput("" if value is None else str(value))
+            if value is None:
+                return io.NodeOutput("")
+
+            if isinstance(value, (dict, list)):
+                return io.NodeOutput(json.dumps(value, ensure_ascii=False))
+
+            return io.NodeOutput(str(value))
 
         return io.NodeOutput("")
 
